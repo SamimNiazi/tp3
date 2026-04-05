@@ -167,13 +167,12 @@ public class Player : NetworkBehaviour
             else { break; }
         }
 
-        if (Vector2.Distance(m_StateTickQueue.Peek().position, state.position) > 0.001f)
+        if (m_StateTickQueue.Count > 0 && Vector2.Distance(m_StateTickQueue.Dequeue().position, state.position) > 0.001f)
         {
             LogStateQueue("After Enqueue");
             Debug.Log($"(Tick:{state.input.tick}, Pos:{state.position}) -> ");
             Queue<StateTick> correctedQueue = new Queue<StateTick>();
             m_PredictedPosition = state;
-            m_StateTickQueue.Dequeue();
             foreach (var states in m_StateTickQueue)
             {
                 PredictPosition(states.input);
