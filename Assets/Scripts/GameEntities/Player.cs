@@ -1,17 +1,18 @@
+using Newtonsoft.Json.Linq;
 using System.Collections;
 using System.Collections.Generic;
 using Unity.Netcode;
 using UnityEngine;
+using UnityEngine.UIElements;
 
-public struct StateTick
+public struct StateTick : INetworkSerializeByMemcpy
 {
     public InputTick input;
     public Vector2 position;
-    public int tick;
 }
-public struct InputTick
+public struct InputTick : INetworkSerializeByMemcpy
 {
-    public int input;
+    public Vector2 input;
     public int tick;
 }
 
@@ -26,6 +27,8 @@ public class Player : NetworkBehaviour
     private float m_Size = 1;
 
     private GameState m_GameState;
+
+    private StateTick m_PredictedPosition;
 
 
     // GameState peut etre nul si l'entite joueur est instanciee avant de charger MainScene
@@ -43,9 +46,9 @@ public class Player : NetworkBehaviour
 
     private NetworkVariable<StateTick> m_Position = new NetworkVariable<StateTick>();
 
-    public Vector2 Position => m_Position.Value.position;
+    public Vector2 Position => (IsClient && IsOwner) ? m_PredictedPosition.position : m_Position.Value.position;
 
-    private Queue<Vector2> m_InputQueue = new Queue<Vector2>();
+    private Queue<InputTick> m_InputQueue = new Queue<InputTick>();
 
     private Queue<StateTick> m_StateTickQueue = new Queue<StateTick>();
 
@@ -55,6 +58,17 @@ public class Player : NetworkBehaviour
         m_GameState = FindFirstObjectByType<GameState>();
     }
 
+    public override void OnNetworkSpawn()
+    {
+        m_Position.OnValueChanged += Reconciliate;
+        base.OnNetworkSpawn();
+    }
+
+    public override void OnNetworkDespawn()
+    {
+        m_Position.OnValueChanged -= Reconciliate;
+        base.OnNetworkDespawn();
+    }
     private void FixedUpdate()
     {
         // Si le stun est active, rien n'est mis a jour.
@@ -82,27 +96,90 @@ public class Player : NetworkBehaviour
         if (m_InputQueue.Count > 0)
         {
             var input = m_InputQueue.Dequeue();
-            m_Position.Value += input * m_Velocity * Time.deltaTime;
+            StateTick position = m_Position.Value;
+            position.position += input.input * m_Velocity * Time.fixedDeltaTime;
+            position.input = input;
 
             // Gestion des collisions avec l'exterieur de la zone de simulation
             var size = GameState.GameSize;
-            if (m_Position.Value.x - m_Size < -size.x)
+            if (position.position.x - m_Size < -size.x)
             {
-                m_Position.Value = new Vector2(-size.x + m_Size, m_Position.Value.y);
+                position.position = new Vector2(-size.x + m_Size, position.position.y);
             }
-            else if (m_Position.Value.x + m_Size > size.x)
+            else if (position.position.x + m_Size > size.x)
             {
-                m_Position.Value = new Vector2(size.x - m_Size, m_Position.Value.y);
+                position.position = new Vector2(size.x - m_Size, position.position.y);
             }
 
-            if (m_Position.Value.y + m_Size > size.y)
+            if (position.position.y + m_Size > size.y)
             {
-                m_Position.Value = new Vector2(m_Position.Value.x, size.y - m_Size);
+                position.position = new Vector2(position.position.x, size.y - m_Size);
             }
-            else if (m_Position.Value.y - m_Size < -size.y)
+            else if (position.position.y - m_Size < -size.y)
             {
-                m_Position.Value = new Vector2(m_Position.Value.x, -size.y + m_Size);
+                position.position = new Vector2(position.position.x, -size.y + m_Size);
             }
+            m_Position.Value = position;
+        }
+    }
+
+    private void PredictPosition(InputTick inputTick)
+    {
+        var position = m_PredictedPosition;
+        position.position += inputTick.input * m_Velocity * Time.fixedDeltaTime;
+        position.input = inputTick;
+
+        // Gestion des collisions avec l'exterieur de la zone de simulation
+        var size = GameState.GameSize;
+        if (position.position.x - m_Size < -size.x)
+        {
+            position.position = new Vector2(-size.x + m_Size, position.position.y);
+        }
+        else if (position.position.x + m_Size > size.x)
+        {
+            position.position = new Vector2(size.x - m_Size, position.position.y);
+        }
+
+        if (position.position.y + m_Size > size.y)
+        {
+            position.position = new Vector2(position.position.x, size.y - m_Size);
+        }
+        else if (position.position.y - m_Size < -size.y)
+        {
+            position.position = new Vector2(position.position.x, -size.y + m_Size);
+        }
+        m_PredictedPosition = position;
+    }
+
+    private void Reconciliate(StateTick oldState, StateTick state)
+    {
+        if (IsServer) { return; }
+
+        if (!IsOwner) 
+        {
+            m_PredictedPosition = state;
+            return;
+        }
+
+        while (m_StateTickQueue.Count > 0)
+        {
+            if (m_StateTickQueue.Peek().input.tick < state.input.tick) { m_StateTickQueue.Dequeue(); }
+            else { break; }
+        }
+
+        if (Vector2.Distance(m_StateTickQueue.Peek().position, state.position) > 0.001f)
+        {
+            LogStateQueue("After Enqueue");
+            Debug.Log($"(Tick:{state.input.tick}, Pos:{state.position}) -> ");
+            Queue<StateTick> correctedQueue = new Queue<StateTick>();
+            m_PredictedPosition = state;
+            m_StateTickQueue.Dequeue();
+            foreach (var states in m_StateTickQueue)
+            {
+                PredictPosition(states.input);
+                correctedQueue.Enqueue(m_PredictedPosition);
+            }
+            m_StateTickQueue = correctedQueue;
         }
     }
 
@@ -125,17 +202,34 @@ public class Player : NetworkBehaviour
         {
             inputDirection += Vector2.right;
         }
-        SendInputServerRpc(inputDirection.normalized);
+        inputDirection = inputDirection.normalized;
+        InputTick input = new InputTick { input = inputDirection, tick = NetworkUtility.GetLocalTick()};
+        SendInputServerRpc(input);
+        PredictPosition(input);
+        m_StateTickQueue.Enqueue(m_PredictedPosition);
     }
 
 
     [ServerRpc]
-    private void SendInputServerRpc(Vector2 input)
+    private void SendInputServerRpc(InputTick input)
     {
         // On utilise une file pour les inputs pour les cas ou on en recoit plusieurs en meme temps.
         m_InputQueue.Enqueue(input);
     }
 
+    private void LogStateQueue(string label = "")
+    {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+
+        sb.Append($"[StateQueue {label}] Count={m_StateTickQueue.Count} | ");
+
+        foreach (var state in m_StateTickQueue)
+        {
+            sb.Append($"(Tick:{state.input.tick}, Pos:{state.position}) -> ");
+        }
+
+        Debug.Log(sb.ToString());
+    }
 
 
 }
