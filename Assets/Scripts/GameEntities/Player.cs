@@ -30,6 +30,8 @@ public class Player : NetworkBehaviour
 
     private StateTick m_PredictedPosition;
 
+    private float TickDelta => 1f / NetworkManager.Singleton.NetworkConfig.TickRate;
+
 
     // GameState peut etre nul si l'entite joueur est instanciee avant de charger MainScene
     private GameState GameState
@@ -60,30 +62,35 @@ public class Player : NetworkBehaviour
 
     public override void OnNetworkSpawn()
     {
+        // Subscribe to the network tick event
+        NetworkManager.NetworkTickSystem.Tick += OnNetworkTick;
+
         m_Position.OnValueChanged += Reconciliate;
         base.OnNetworkSpawn();
     }
 
     public override void OnNetworkDespawn()
     {
+        // IMPORTANT: Always unsubscribe to prevent memory leaks
+        if (NetworkManager != null && NetworkManager.NetworkTickSystem != null)
+        {
+            NetworkManager.NetworkTickSystem.Tick -= OnNetworkTick;
+        }
+
         m_Position.OnValueChanged -= Reconciliate;
         base.OnNetworkDespawn();
     }
-    private void FixedUpdate()
-    {
-        // Si le stun est active, rien n'est mis a jour.
-        if (GameState == null || GameState.IsStunned)
-        {
-            return;
-        }
 
-        // Seul le serveur met à jour la position de l'entite.
+    private void OnNetworkTick()
+    {
+        // Stop using FixedUpdate for these!
+        if (GameState == null) return;
+
         if (IsServer)
         {
             UpdatePositionServer();
         }
 
-        // Seul le client qui possede cette entite peut envoyer ses inputs. 
         if (IsClient && IsOwner)
         {
             UpdateInputClient();
@@ -97,7 +104,7 @@ public class Player : NetworkBehaviour
         {
             var input = m_InputQueue.Dequeue();
             StateTick position = m_Position.Value;
-            position.position += input.input * m_Velocity * Time.fixedDeltaTime;
+            position.position += input.input * m_Velocity * TickDelta;
             position.input = input;
 
             // Gestion des collisions avec l'exterieur de la zone de simulation
@@ -126,7 +133,7 @@ public class Player : NetworkBehaviour
     private void PredictPosition(InputTick inputTick)
     {
         var position = m_PredictedPosition;
-        position.position += inputTick.input * m_Velocity * Time.fixedDeltaTime;
+        position.position += inputTick.input * m_Velocity * TickDelta;
         position.input = inputTick;
 
         // Gestion des collisions avec l'exterieur de la zone de simulation
@@ -155,7 +162,7 @@ public class Player : NetworkBehaviour
     {
         if (IsServer) { return; }
 
-        if (!IsOwner) 
+        if (!IsOwner)
         {
             m_PredictedPosition = state;
             return;
@@ -202,7 +209,7 @@ public class Player : NetworkBehaviour
             inputDirection += Vector2.right;
         }
         inputDirection = inputDirection.normalized;
-        InputTick input = new InputTick { input = inputDirection, tick = NetworkUtility.GetLocalTick()};
+        InputTick input = new InputTick { input = inputDirection, tick = NetworkUtility.GetLocalTick() };
         SendInputServerRpc(input);
         PredictPosition(input);
         m_StateTickQueue.Enqueue(m_PredictedPosition);
