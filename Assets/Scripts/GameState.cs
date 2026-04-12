@@ -4,6 +4,12 @@ using System.Collections.Generic;
 using Unity.Netcode;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+public struct StunStatus : INetworkSerializeByMemcpy
+{
+    public bool IsStunned;
+    public int endTick;
+}
+
 
 public class GameState : NetworkBehaviour
 {
@@ -18,9 +24,11 @@ public class GameState : NetworkBehaviour
 
     public Vector2 GameSize { get => m_GameSize; }
 
-    private NetworkVariable<bool> m_IsStunned = new NetworkVariable<bool>();
+    public NetworkVariable<StunStatus> m_IsStunned = new NetworkVariable<StunStatus>();
 
-    public bool IsStunned { get => m_IsStunned.Value; }
+    public StunStatus local_Stunned;
+
+    public StunStatus IsStunned { get => IsServer ? m_IsStunned.Value : local_Stunned ; }
 
     private Coroutine m_StunCoroutine;
 
@@ -28,7 +36,7 @@ public class GameState : NetworkBehaviour
 
     public float CurrentRTT { get => m_CurrentRtt / 1000f; }
 
-    public NetworkVariable<float> ServerTime;
+    public NetworkVariable<float> ServerTime = new NetworkVariable<float>();
 
     private void Start()
     {
@@ -42,7 +50,7 @@ public class GameState : NetworkBehaviour
             m_CurrentRtt = NetworkManager.NetworkConfig.NetworkTransport.GetCurrentRtt(NetworkManager.ServerClientId);
         }
 
-        if (IsServer)
+        if (IsSpawned && IsServer)
         {
             ServerTime.Value = Time.time;
         }
@@ -67,22 +75,26 @@ public class GameState : NetworkBehaviour
         }
     }
 
-    public void Stun()
+    public void Stun(int currentTick)
     {
-        if (m_StunCoroutine != null)
-        {
-            StopCoroutine(m_StunCoroutine);
-        }
+        var tickRate = NetworkManager.NetworkConfig.TickRate;
+        int durationInTicks = Mathf.CeilToInt(m_StunDuration * tickRate);
         if (IsServer)
         {
-            m_StunCoroutine = StartCoroutine(StunCoroutine());
+            m_IsStunned.Value = new StunStatus
+            {
+                IsStunned = true,
+                endTick = currentTick + durationInTicks
+            };
+            //Debug.Log(m_IsStunned.Value.endTick);
         }
-    }
-
-    private IEnumerator StunCoroutine()
-    {
-        m_IsStunned.Value = true;
-        yield return new WaitForSeconds(m_StunDuration);
-        m_IsStunned.Value = false;
+        else if (IsClient)
+        {
+            local_Stunned = new StunStatus
+            {
+                IsStunned = true,
+                endTick = currentTick + durationInTicks
+            };
+        }
     }
 }

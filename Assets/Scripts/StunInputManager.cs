@@ -15,6 +15,7 @@ public class StunInputManager : NetworkBehaviour
         {
             if (Input.GetKeyDown(KeyCode.Space))
             {
+                m_GameState.Stun(NetworkUtility.GetLocalTick());
                 ActivateStunServerRpc();
             }
         }
@@ -23,6 +24,6 @@ public class StunInputManager : NetworkBehaviour
     [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Everyone)]
     private void ActivateStunServerRpc()
     {
-        m_GameState.Stun();
+        m_GameState.Stun(NetworkUtility.GetLocalTick());
     }
 }

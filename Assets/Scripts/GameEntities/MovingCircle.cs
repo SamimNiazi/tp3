@@ -37,7 +37,7 @@ public class MovingCircle : NetworkBehaviour
     private void FixedUpdate()
     {
         // Si le stun est active, rien n'est mis a jour.
-        if (m_GameState.IsStunned)
+        if (m_GameState.IsStunned.IsStunned)
         {
             return;
         }
