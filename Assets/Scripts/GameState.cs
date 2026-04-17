@@ -9,7 +9,7 @@ public class GameState : NetworkBehaviour
     private GameObject m_GameArea;
 
     [SerializeField]
-    private float m_StunDuration = 1.0f;
+    private float m_StunDuration = 3.0f;
 
     [SerializeField]
     private Vector2 m_GameSize;
@@ -62,7 +62,7 @@ public class GameState : NetworkBehaviour
     // Evaluates stun correctly no matter if the queried tick is past, present, or future
     public bool IsStunnedAtTick(int queryTick)
     {
-        int durationTicks = Mathf.CeilToInt(3 * NetworkManager.NetworkTickSystem.TickRate);
+        int durationTicks = Mathf.CeilToInt(5 * NetworkManager.NetworkTickSystem.TickRate);
 
         // 1. Check Server Confirmed Stuns
         foreach (int startTick in GlobalStunStarts)

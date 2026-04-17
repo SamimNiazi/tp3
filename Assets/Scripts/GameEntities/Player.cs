@@ -2,13 +2,12 @@
 using UnityEngine;
 using System.Collections.Generic;
 
-// InputTick — stunTick n'est plus nécessaire
 public struct InputTick : INetworkSerializeByMemcpy
 {
     public Vector2 input;
     public bool stunPressed;
-    public int tick;      // local tick — réconciliation mouvement
-    public int stunTick;  // server tick — vérification stun
+    public int tick;      // localTick — réconciliation mouvement joueur
+    public int stunTick;  // serverTick — stun vit en serverTick-space (comme GlobalStunStarts)
 }
 
 public struct StateTick : INetworkSerializeByMemcpy
@@ -32,7 +31,7 @@ public class Player : NetworkBehaviour
     public Vector2 Position => (IsClient && IsOwner) ? m_PredictedState.position : m_ServerState.Value.position;
 
     private Queue<InputTick> m_InputQueue = new Queue<InputTick>();
-    private List<StateTick> m_StateHistory = new List<StateTick>(); // Changed to List for easier history management
+    private List<StateTick> m_StateHistory = new List<StateTick>();
 
     private bool m_StunBuffered;
     private bool m_HasNewServerState;
@@ -49,9 +48,7 @@ public class Player : NetworkBehaviour
         m_ServerState.OnValueChanged += OnServerStateChanged;
 
         if (IsOwner)
-        {
             m_PredictedState = new StateTick { position = transform.position };
-        }
     }
 
     public override void OnNetworkDespawn()
@@ -63,11 +60,8 @@ public class Player : NetworkBehaviour
 
     private void Update()
     {
-        // Buffer input so we don't miss keydowns between tick intervals
         if (IsClient && IsOwner && Input.GetKeyDown(KeyCode.Space))
-        {
             m_StunBuffered = true;
-        }
     }
 
     private void OnServerStateChanged(StateTick oldState, StateTick newState)
@@ -75,7 +69,7 @@ public class Player : NetworkBehaviour
         if (IsClient && IsOwner)
         {
             m_LatestServerState = newState;
-            m_HasNewServerState = true; // Flag for OnNetworkTick to handle
+            m_HasNewServerState = true;
         }
     }
 
@@ -102,15 +96,15 @@ public class Player : NetworkBehaviour
         while (m_InputQueue.Count > 0)
         {
             var input = m_InputQueue.Dequeue();
-            int localTick = NetworkUtility.GetLocalTick();    // tick du client — pour la réconciliation
-            int serverTick = NetworkManager.ServerTime.Tick;
 
+            // Le stun est appliqué avec stunTick (serverTick-space)
             if (input.stunPressed)
-                m_GameState.ApplyStun(input.tick);  // ← toujours le tick serveur courant
+                m_GameState.ApplyStun(input.stunTick);
 
             StateTick state = m_ServerState.Value;
 
-            if (!m_GameState.IsStunnedAtTick(input.tick))  // ← même tick
+            // Le mouvement est bloqué si le stunTick de cet input est dans une période de stun
+            if (!m_GameState.IsStunnedAtTick(input.stunTick))
                 state.position += input.input * m_Velocity * TickDelta;
 
             state.input = input;
@@ -118,6 +112,7 @@ public class Player : NetworkBehaviour
             m_ServerState.Value = state;
         }
     }
+
     private void UpdateInputClient()
     {
         Vector2 inputDirection = Vector2.zero;
@@ -131,31 +126,30 @@ public class Player : NetworkBehaviour
         m_StunBuffered = false;
 
         int localTick = NetworkUtility.GetLocalTick();
-        int serverTick = NetworkManager.ServerTime.Tick;
+        int serverTick = NetworkUtility.GetServerTick();
 
         InputTick input = new InputTick
         {
             input = inputDirection,
             stunPressed = stunPressed,
             tick = localTick,
-            stunTick = serverTick,  // ← stocké pour PredictPosition
+            stunTick = serverTick,
         };
 
         SendInputServerRpc(input);
 
+        // Stun prédit localement en serverTick-space pour cohérence avec GlobalStunStarts
         if (stunPressed)
-            m_GameState.ApplyStun(localTick);
+            m_GameState.ApplyStun(serverTick);
 
         PredictPosition(input);
     }
 
     private void PredictPosition(InputTick input)
     {
-        // ← utilise stunTick (server-space) au lieu de tick (local-space)
-        if (!m_GameState.IsStunnedAtTick(input.tick))
-        {
+        // Utiliser stunTick (serverTick-space) — même espace que GlobalStunStarts
+        if (!m_GameState.IsStunnedAtTick(input.stunTick))
             m_PredictedState.position += input.input * m_Velocity * TickDelta;
-        }
 
         m_PredictedState.input = input;
         m_PredictedState.position = ClampToGameArea(m_PredictedState.position);
@@ -164,20 +158,16 @@ public class Player : NetworkBehaviour
 
     private void Reconciliate()
     {
-        // 1. Cull old predictions up to the tick the server just confirmed
+        // Supprimer les prédictions confirmées par le serveur (comparaison en localTick)
         m_StateHistory.RemoveAll(s => s.input.tick <= m_LatestServerState.input.tick);
 
-        // 2. Snap to the authoritative server state
         m_PredictedState = m_LatestServerState;
 
-        // 3. Re-simulate the pending queue. Stun states will naturally evaluate correctly here.
         List<StateTick> oldHistory = new List<StateTick>(m_StateHistory);
         m_StateHistory.Clear();
 
         foreach (var state in oldHistory)
-        {
             PredictPosition(state.input);
-        }
     }
 
     private Vector2 ClampToGameArea(Vector2 pos)

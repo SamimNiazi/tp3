@@ -1,31 +1,38 @@
 ﻿using Unity.Netcode;
 using UnityEngine;
+using System.Collections.Generic;
 
 public struct CircleState : INetworkSerializeByMemcpy
 {
     public Vector2 position;
     public Vector2 velocity;
-    public int tick; // The specific tick this state was calculated on
+    public int tick;
 }
 
 public class MovingCircle : NetworkBehaviour
 {
-    [SerializeField] private float m_Radius = 1;
+    [SerializeField] private float m_Radius = 1f;
+    [SerializeField] private float m_PositionReconcileEpsilon = 0.0001f;
+    [SerializeField] private float m_VelocityReconcileEpsilon = 0.0001f;
+    [SerializeField] private int m_MaxHistorySize = 512;
 
     public Vector2 InitialPosition;
     public Vector2 InitialVelocity;
 
     private NetworkVariable<CircleState> m_ServerState = new NetworkVariable<CircleState>();
+
     private GameState m_GameState;
 
-    private Vector2 m_PredictedPosition;
-    private Vector2 m_PredictedVelocity;
-
-    private bool m_HasNewServerState;
+    private CircleState m_PredictedState;
     private CircleState m_LatestServerState;
+    private bool m_HasNewServerState;
 
-    public Vector2 Position => IsServer ? m_ServerState.Value.position : m_PredictedPosition;
-    public Vector2 Velocity => IsServer ? m_ServerState.Value.velocity : m_PredictedVelocity;
+    private readonly List<CircleState> m_StateHistory = new List<CircleState>();
+
+    public Vector2 Position => IsServer ? m_ServerState.Value.position : m_PredictedState.position;
+    public Vector2 Velocity => IsServer ? m_ServerState.Value.velocity : m_PredictedState.velocity;
+
+    private float TickDelta => 1f / NetworkManager.NetworkTickSystem.TickRate;
 
     private void Awake()
     {
@@ -42,13 +49,17 @@ public class MovingCircle : NetworkBehaviour
             {
                 position = InitialPosition,
                 velocity = InitialVelocity,
-                tick = NetworkManager.ServerTime.Tick
+                tick = NetworkUtility.GetServerTick()
             };
         }
         else
         {
-            m_PredictedPosition = InitialPosition;
-            m_PredictedVelocity = InitialVelocity;
+            m_PredictedState = m_ServerState.Value;
+            m_LatestServerState = m_ServerState.Value;
+
+            m_StateHistory.Clear();
+            m_StateHistory.Add(m_PredictedState);
+
             m_ServerState.OnValueChanged += OnServerStateChanged;
         }
     }
@@ -59,9 +70,7 @@ public class MovingCircle : NetworkBehaviour
             NetworkManager.NetworkTickSystem.Tick -= OnNetworkTick;
 
         if (!IsServer)
-        {
             m_ServerState.OnValueChanged -= OnServerStateChanged;
-        }
     }
 
     private void OnServerStateChanged(CircleState oldState, CircleState newState)
@@ -72,94 +81,181 @@ public class MovingCircle : NetworkBehaviour
 
     private void OnNetworkTick()
     {
-        float delta = 1f / NetworkManager.NetworkTickSystem.TickRate;
+        if (m_GameState == null)
+            return;
 
         if (IsServer)
         {
-            int currentServerTick = NetworkManager.ServerTime.Tick;
-
-            if (!m_GameState.IsStunnedAtTick(currentServerTick))
-            {
-                var state = m_ServerState.Value;
-                state = SimulateStep(state, delta);
-                state.tick = currentServerTick;
-                m_ServerState.Value = state;
-            }
+            UpdateServer();
+            return;
         }
-        else
+
+        int predictedTick = GetPredictedTick();
+        int currentServerTickEstimate = NetworkUtility.GetServerTick();
+
+        if (m_HasNewServerState)
         {
-            int localTick = NetworkUtility.GetLocalTick();
-            int serverTick = NetworkManager.ServerTime.Tick;
+            TryReconciliate(predictedTick, currentServerTickEstimate);
+            m_HasNewServerState = false;
+        }
 
-            if (m_HasNewServerState)
-            {
-                Reconciliate(localTick, delta);
-                m_HasNewServerState = false;
-            }
+        while (m_PredictedState.tick < predictedTick)
+        {
+            int nextSimulatedTick = m_PredictedState.tick + 1;
 
-            // ✅ serverTick pour le stun, pas localTick
-            if (!m_GameState.IsStunnedAtTick(serverTick))
-            {
-                CircleState predicted = new CircleState
-                {
-                    position = m_PredictedPosition,
-                    velocity = m_PredictedVelocity
-                };
-                predicted = SimulateStep(predicted, delta);
-                m_PredictedPosition = predicted.position;
-                m_PredictedVelocity = predicted.velocity;
-            }
+            // IMPORTANT :
+            // le ghost peut être avancé visuellement,
+            // mais le stun reste évalué au temps courant serveur estimé.
+            m_PredictedState = SimulateOneTick(
+                m_PredictedState,
+                nextSimulatedTick,
+                currentServerTickEstimate
+            );
+
+            AddStateToHistory(m_PredictedState);
+        }
+
+        CleanupHistory();
+    }
+
+    private void UpdateServer()
+    {
+        int currentServerTick = NetworkUtility.GetServerTick();
+        CircleState state = m_ServerState.Value;
+
+        while (state.tick < currentServerTick)
+        {
+            state = SimulateOneTick(state, state.tick + 1, state.tick + 1);
+        }
+
+        m_ServerState.Value = state;
+    }
+
+    private int GetPredictedTick()
+    {
+        int localTick = NetworkUtility.GetLocalTick();
+        ulong rttMs = NetworkUtility.GetCurrentRtt(NetworkManager.ServerClientId);
+
+        float tickRate = NetworkManager.NetworkTickSystem.TickRate;
+        int halfRttTicks = Mathf.RoundToInt((rttMs / 1000f) * 0.5f * tickRate);
+
+        return localTick + halfRttTicks;
+    }
+
+    private void TryReconciliate(int predictedTick, int currentServerTickEstimate)
+    {
+        CircleState? predictedAtSameTick = FindHistoryState(m_LatestServerState.tick);
+        bool mustReconcile = true;
+
+        if (predictedAtSameTick.HasValue)
+        {
+            mustReconcile = StatesDiffer(predictedAtSameTick.Value, m_LatestServerState);
+        }
+
+        if (!mustReconcile)
+        {
+            RemoveHistoryUpToTick(m_LatestServerState.tick - 1);
+            return;
+        }
+
+        m_PredictedState = m_LatestServerState;
+
+        m_StateHistory.Clear();
+        m_StateHistory.Add(m_PredictedState);
+
+        while (m_PredictedState.tick < predictedTick)
+        {
+            int nextSimulatedTick = m_PredictedState.tick + 1;
+
+            m_PredictedState = SimulateOneTick(
+                m_PredictedState,
+                nextSimulatedTick,
+                currentServerTickEstimate
+            );
+
+            AddStateToHistory(m_PredictedState);
         }
     }
 
-    private void Reconciliate(int targetTick, float delta)
+    private CircleState? FindHistoryState(int tick)
     {
-        CircleState state = m_LatestServerState;
-
-        // fast-forward jusqu'à targetTick - 1 inclus
-        // le step normal dans OnNetworkTick avancera jusqu'à targetTick
-        int ticksToSimulate = targetTick - state.tick - 1;
-
-        for (int i = 0; i < ticksToSimulate; i++)
+        for (int i = 0; i < m_StateHistory.Count; i++)
         {
-            int simulationTick = state.tick + i;
-            if (!m_GameState.IsStunnedAtTick(simulationTick))
-            {
-                state = SimulateStep(state, delta);
-            }
+            if (m_StateHistory[i].tick == tick)
+                return m_StateHistory[i];
         }
 
-        m_PredictedPosition = state.position;
-        m_PredictedVelocity = state.velocity;
+        return null;
     }
 
-    private CircleState SimulateStep(CircleState state, float delta)
+    private bool StatesDiffer(CircleState a, CircleState b)
     {
-        state.position += state.velocity * delta;
+        bool positionDiffers =
+            (a.position - b.position).sqrMagnitude >
+            m_PositionReconcileEpsilon * m_PositionReconcileEpsilon;
 
-        var size = m_GameState.GameSize;
+        bool velocityDiffers =
+            (a.velocity - b.velocity).sqrMagnitude >
+            m_VelocityReconcileEpsilon * m_VelocityReconcileEpsilon;
+
+        return positionDiffers || velocityDiffers;
+    }
+
+    private CircleState SimulateOneTick(CircleState state, int simulatedTick, int stunQueryTick)
+    {
+        state.tick = simulatedTick;
+
+        if (m_GameState.IsStunnedAtTick(stunQueryTick))
+            return state;
+
+        state.position += state.velocity * TickDelta;
+
+        Vector2 size = m_GameState.GameSize;
+
         if (state.position.x - m_Radius < -size.x)
         {
             state.position = new Vector2(-size.x + m_Radius, state.position.y);
-            state.velocity *= new Vector2(-1, 1);
+            state.velocity = new Vector2(-state.velocity.x, state.velocity.y);
         }
         else if (state.position.x + m_Radius > size.x)
         {
             state.position = new Vector2(size.x - m_Radius, state.position.y);
-            state.velocity *= new Vector2(-1, 1);
+            state.velocity = new Vector2(-state.velocity.x, state.velocity.y);
         }
 
-        if (state.position.y + m_Radius > size.y)
-        {
-            state.position = new Vector2(state.position.x, size.y - m_Radius);
-            state.velocity *= new Vector2(1, -1);
-        }
-        else if (state.position.y - m_Radius < -size.y)
+        if (state.position.y - m_Radius < -size.y)
         {
             state.position = new Vector2(state.position.x, -size.y + m_Radius);
-            state.velocity *= new Vector2(1, -1);
+            state.velocity = new Vector2(state.velocity.x, -state.velocity.y);
+        }
+        else if (state.position.y + m_Radius > size.y)
+        {
+            state.position = new Vector2(state.position.x, size.y - m_Radius);
+            state.velocity = new Vector2(state.velocity.x, -state.velocity.y);
         }
 
         return state;
+    }
+
+    private void AddStateToHistory(CircleState state)
+    {
+        m_StateHistory.Add(state);
+
+        if (m_StateHistory.Count > m_MaxHistorySize)
+        {
+            int extra = m_StateHistory.Count - m_MaxHistorySize;
+            m_StateHistory.RemoveRange(0, extra);
+        }
+    }
+
+    private void RemoveHistoryUpToTick(int tick)
+    {
+        m_StateHistory.RemoveAll(s => s.tick <= tick);
+    }
+
+    private void CleanupHistory()
+    {
+        int minUsefulTick = m_PredictedState.tick - m_MaxHistorySize;
+        m_StateHistory.RemoveAll(s => s.tick < minUsefulTick);
     }
 }
