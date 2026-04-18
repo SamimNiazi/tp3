@@ -85,7 +85,6 @@ public class MovingCircle : NetworkBehaviour
                 m_HasNewState = false;
             }
 
-            // Le client prédit le monde à l’horizon choisi : ServerTime + RTT
             float predictedWorldTime = m_GameState.ServerTime.Value + m_GameState.CurrentRTT;
 
             if (!m_GameState.IsStunnedAtTime(predictedWorldTime))

@@ -11,11 +11,9 @@ public class GameState : NetworkBehaviour
 
     public Vector2 GameSize => m_GameSize;
 
-    // Liste autoritative des débuts de stun
     public NetworkList<float> GlobalStunStarts;
     private List<float> m_LocalPredictedStuns = new List<float>();
 
-    // Horloge serveur répliquée
     public NetworkVariable<float> ServerTime = new NetworkVariable<float>();
 
     public float CurrentRTT =>
@@ -57,7 +55,6 @@ public class GameState : NetworkBehaviour
     {
         if (IsServer)
         {
-            // Temps autoritatif du serveur
             ServerTime.Value = (float)NetworkManager.LocalTime.TimeAsFloat;
         }
 

@@ -122,7 +122,6 @@ public class Player : NetworkBehaviour
     {
         Vector2 dir = new Vector2(Input.GetAxisRaw("Horizontal"), Input.GetAxisRaw("Vertical")).normalized;
 
-        // On choisit explicitement le temps serveur auquel cette action doit être appliquée
         float actionTime = m_GameState.ServerTime.Value + m_GameState.CurrentRTT;
 
         InputData input = new InputData
@@ -136,7 +135,6 @@ public class Player : NetworkBehaviour
 
         SendInputServerRpc(input);
 
-        // Prédiction locale immédiate du stun au même temps logique que celui envoyé au serveur
         if (input.stunPressed)
             m_GameState.ApplyStun(input.timestamp);
 
@@ -145,8 +143,6 @@ public class Player : NetworkBehaviour
 
     private void PredictPosition(InputData input)
     {
-        // IMPORTANT:
-        // On teste le stun au MEME temps logique que celui utilisé par le serveur.
         if (!m_GameState.IsStunnedAtTime(input.timestamp))
             m_PredictedState.position += input.input * m_Velocity * TickDelta;
 
