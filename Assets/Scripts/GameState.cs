@@ -5,38 +5,39 @@ using System.Collections.Generic;
 
 public class GameState : NetworkBehaviour
 {
-    [SerializeField]
-    private GameObject m_GameArea;
-
-    [SerializeField]
-    private float m_StunDuration = 1.0f;
-
-    [SerializeField]
-    private Vector2 m_GameSize;
+    [SerializeField] private GameObject m_GameArea;
+    [SerializeField] private float m_StunDuration = 1.0f;
+    [SerializeField] private Vector2 m_GameSize;
 
     public Vector2 GameSize => m_GameSize;
 
-    // Track the EXACT start ticks of stuns for accurate historical replays
-    public NetworkList<int> GlobalStunStarts;
+    public NetworkList<float> GlobalStunStarts;
+    private List<float> m_LocalPredictedStuns = new List<float>();
 
-    // Clients predict their own stuns before the server confirms them
-    private List<int> m_LocalPredictedStuns = new List<int>();
+    public NetworkVariable<float> ServerTime = new NetworkVariable<float>();
+
+    public float CurrentRTT =>
+        IsClient
+            ? NetworkManager.NetworkConfig.NetworkTransport.GetCurrentRtt(NetworkManager.ServerClientId) / 1000f
+            : 0f;
 
     private void Awake()
     {
-        // NetworkList MUST be initialized in Awake
-        GlobalStunStarts = new NetworkList<int>();
+        GlobalStunStarts = new NetworkList<float>();
     }
 
     private void Start()
     {
-        m_GameArea.transform.localScale = new Vector3(m_GameSize.x * 2, m_GameSize.y * 2, 1);
+        if (m_GameArea != null)
+            m_GameArea.transform.localScale = new Vector3(m_GameSize.x * 2, m_GameSize.y * 2, 1);
     }
 
     public override void OnNetworkSpawn()
     {
         NetworkManager.OnClientDisconnectCallback += OnClientDisconnect;
-        NetworkManager.NetworkTickSystem.Tick += CleanUpOldStuns;
+
+        if (NetworkManager.NetworkTickSystem != null)
+            NetworkManager.NetworkTickSystem.Tick += OnNetworkTick;
     }
 
     public override void OnNetworkDespawn()
@@ -44,73 +45,68 @@ public class GameState : NetworkBehaviour
         if (NetworkManager != null)
         {
             NetworkManager.OnClientDisconnectCallback -= OnClientDisconnect;
+
             if (NetworkManager.NetworkTickSystem != null)
-            {
-                NetworkManager.NetworkTickSystem.Tick -= CleanUpOldStuns;
-            }
+                NetworkManager.NetworkTickSystem.Tick -= OnNetworkTick;
         }
+    }
+
+    private void OnNetworkTick()
+    {
+        if (IsServer)
+        {
+            ServerTime.Value = (float)NetworkManager.LocalTime.TimeAsFloat;
+        }
+
+        CleanUpOldStuns();
     }
 
     private void OnClientDisconnect(ulong clientId)
     {
         if (!IsServer)
-        {
             SceneManager.LoadScene("StartupScene");
-        }
     }
 
-    // Evaluates stun correctly no matter if the queried tick is past, present, or future
-    public bool IsStunnedAtTick(int queryTick)
+    public bool IsStunnedAtTime(float time)
     {
-        int durationTicks = Mathf.CeilToInt(3 * NetworkManager.NetworkTickSystem.TickRate);
-
-        // 1. Check Server Confirmed Stuns
-        foreach (int startTick in GlobalStunStarts)
+        foreach (float start in GlobalStunStarts)
         {
-            if (queryTick >= startTick && queryTick < startTick + durationTicks)
+            if (time >= start && time <= start + m_StunDuration)
                 return true;
         }
 
-        // 2. Check Locally Predicted Stuns
-        foreach (int startTick in m_LocalPredictedStuns)
+        if (IsClient)
         {
-            if (queryTick >= startTick && queryTick < startTick + durationTicks)
-                return true;
+            foreach (float start in m_LocalPredictedStuns)
+            {
+                if (time >= start && time <= start + m_StunDuration)
+                    return true;
+            }
         }
 
         return false;
     }
 
-    public void ApplyStun(int startTick)
+    public void ApplyStun(float startTime)
     {
-        if (IsServer)
-        {
-            if (!GlobalStunStarts.Contains(startTick))
-                GlobalStunStarts.Add(startTick);
-        }
+        if (IsServer && !GlobalStunStarts.Contains(startTime))
+            GlobalStunStarts.Add(startTime);
 
-        if (IsClient)
-        {
-            if (!m_LocalPredictedStuns.Contains(startTick))
-                m_LocalPredictedStuns.Add(startTick);
-        }
+        if (IsClient && !m_LocalPredictedStuns.Contains(startTime))
+            m_LocalPredictedStuns.Add(startTime);
     }
 
-    // Prevents memory leaks by clearing out stuns that are way in the past
     private void CleanUpOldStuns()
     {
-        int currentTick = NetworkManager.ServerTime.Tick;
-        int durationTicks = Mathf.CeilToInt(m_StunDuration * NetworkManager.NetworkTickSystem.TickRate);
-        int historyBuffer = (int)(NetworkManager.NetworkTickSystem.TickRate * 3f); // Keep in history for 3 seconds past end time
+        float currentTime = ServerTime.Value;
+        float buffer = 3.0f;
 
         if (IsServer)
         {
             for (int i = GlobalStunStarts.Count - 1; i >= 0; i--)
             {
-                if (currentTick > GlobalStunStarts[i] + durationTicks + historyBuffer)
-                {
+                if (currentTime > GlobalStunStarts[i] + m_StunDuration + buffer)
                     GlobalStunStarts.RemoveAt(i);
-                }
             }
         }
 
@@ -118,10 +114,8 @@ public class GameState : NetworkBehaviour
         {
             for (int i = m_LocalPredictedStuns.Count - 1; i >= 0; i--)
             {
-                if (currentTick > m_LocalPredictedStuns[i] + durationTicks + historyBuffer)
-                {
+                if (currentTime > m_LocalPredictedStuns[i] + m_StunDuration + buffer)
                     m_LocalPredictedStuns.RemoveAt(i);
-                }
             }
         }
     }

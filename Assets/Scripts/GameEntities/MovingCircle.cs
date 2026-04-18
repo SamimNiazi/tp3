@@ -5,27 +5,23 @@ public struct CircleState : INetworkSerializeByMemcpy
 {
     public Vector2 position;
     public Vector2 velocity;
-    public int tick; // The specific tick this state was calculated on
+    public float timestamp;
 }
 
 public class MovingCircle : NetworkBehaviour
 {
-    [SerializeField] private float m_Radius = 1;
-
-    public Vector2 InitialPosition;
-    public Vector2 InitialVelocity;
+    [SerializeField] private float m_Radius = 1f;
+    public Vector2 InitialPosition, InitialVelocity;
 
     private NetworkVariable<CircleState> m_ServerState = new NetworkVariable<CircleState>();
     private GameState m_GameState;
 
-    private Vector2 m_PredictedPosition;
-    private Vector2 m_PredictedVelocity;
+    private Vector2 m_PredictedPos, m_PredictedVel;
+    private bool m_HasNewState;
+    private CircleState m_LatestState;
 
-    private bool m_HasNewServerState;
-    private CircleState m_LatestServerState;
-
-    public Vector2 Position => IsServer ? m_ServerState.Value.position : m_PredictedPosition;
-    public Vector2 Velocity => IsServer ? m_ServerState.Value.velocity : m_PredictedVelocity;
+    private float TickDelta => 1f / NetworkManager.NetworkTickSystem.TickRate;
+    public Vector2 Position => IsServer ? m_ServerState.Value.position : m_PredictedPos;
 
     private void Awake()
     {
@@ -42,14 +38,20 @@ public class MovingCircle : NetworkBehaviour
             {
                 position = InitialPosition,
                 velocity = InitialVelocity,
-                tick = NetworkManager.ServerTime.Tick
+                timestamp = (float)NetworkManager.LocalTime.TimeAsFloat
             };
         }
         else
         {
-            m_PredictedPosition = InitialPosition;
-            m_PredictedVelocity = InitialVelocity;
-            m_ServerState.OnValueChanged += OnServerStateChanged;
+            var initial = m_ServerState.Value;
+            m_PredictedPos = initial.position;
+            m_PredictedVel = initial.velocity;
+
+            m_ServerState.OnValueChanged += (oldV, newV) =>
+            {
+                m_LatestState = newV;
+                m_HasNewState = true;
+            };
         }
     }
 
@@ -57,109 +59,96 @@ public class MovingCircle : NetworkBehaviour
     {
         if (NetworkManager != null && NetworkManager.NetworkTickSystem != null)
             NetworkManager.NetworkTickSystem.Tick -= OnNetworkTick;
-
-        if (!IsServer)
-        {
-            m_ServerState.OnValueChanged -= OnServerStateChanged;
-        }
-    }
-
-    private void OnServerStateChanged(CircleState oldState, CircleState newState)
-    {
-        m_LatestServerState = newState;
-        m_HasNewServerState = true;
     }
 
     private void OnNetworkTick()
     {
-        float delta = 1f / NetworkManager.NetworkTickSystem.TickRate;
+        if (m_GameState == null)
+            return;
 
         if (IsServer)
         {
-            int currentServerTick = NetworkManager.ServerTime.Tick;
+            var state = m_ServerState.Value;
+            float simTime = m_GameState.ServerTime.Value;
 
-            if (!m_GameState.IsStunnedAtTick(currentServerTick))
-            {
-                var state = m_ServerState.Value;
-                state = SimulateStep(state, delta);
-                state.tick = currentServerTick;
-                m_ServerState.Value = state;
-            }
+            if (!m_GameState.IsStunnedAtTime(simTime))
+                state = SimulateStep(state, TickDelta);
+
+            state.timestamp = simTime;
+            m_ServerState.Value = state;
         }
         else
         {
-            int localTick = NetworkUtility.GetLocalTick();
-            int serverTick = NetworkManager.ServerTime.Tick;
-
-            if (m_HasNewServerState)
+            if (m_HasNewState)
             {
-                Reconciliate(localTick, delta);
-                m_HasNewServerState = false;
+                Reconciliate(TickDelta);
+                m_HasNewState = false;
             }
 
-            // ✅ serverTick pour le stun, pas localTick
-            if (!m_GameState.IsStunnedAtTick(serverTick))
+            float predictedWorldTime = m_GameState.ServerTime.Value + m_GameState.CurrentRTT;
+
+            if (!m_GameState.IsStunnedAtTime(predictedWorldTime))
             {
-                CircleState predicted = new CircleState
-                {
-                    position = m_PredictedPosition,
-                    velocity = m_PredictedVelocity
-                };
-                predicted = SimulateStep(predicted, delta);
-                m_PredictedPosition = predicted.position;
-                m_PredictedVelocity = predicted.velocity;
+                var next = SimulateStep(
+                    new CircleState
+                    {
+                        position = m_PredictedPos,
+                        velocity = m_PredictedVel,
+                        timestamp = predictedWorldTime
+                    },
+                    TickDelta
+                );
+
+                m_PredictedPos = next.position;
+                m_PredictedVel = next.velocity;
             }
         }
     }
 
-    private void Reconciliate(int targetTick, float delta)
+    private void Reconciliate(float delta)
     {
-        CircleState state = m_LatestServerState;
+        CircleState state = m_LatestState;
 
-        // fast-forward jusqu'à targetTick - 1 inclus
-        // le step normal dans OnNetworkTick avancera jusqu'à targetTick
-        int ticksToSimulate = targetTick - state.tick - 1;
+        float targetTime = m_GameState.ServerTime.Value + m_GameState.CurrentRTT;
+        float timeToFastForward = targetTime - state.timestamp;
 
-        for (int i = 0; i < ticksToSimulate; i++)
+        int steps = Mathf.Max(0, Mathf.RoundToInt(timeToFastForward / delta));
+
+        for (int i = 0; i < steps; i++)
         {
-            int simulationTick = state.tick + i;
-            if (!m_GameState.IsStunnedAtTick(simulationTick))
-            {
+            float simTime = state.timestamp + (i * delta);
+
+            if (!m_GameState.IsStunnedAtTime(simTime))
                 state = SimulateStep(state, delta);
-            }
         }
 
-        m_PredictedPosition = state.position;
-        m_PredictedVelocity = state.velocity;
+        m_PredictedPos = state.position;
+        m_PredictedVel = state.velocity;
     }
 
-    private CircleState SimulateStep(CircleState state, float delta)
+    private CircleState SimulateStep(CircleState state, float dt)
     {
-        state.position += state.velocity * delta;
+        state.position += state.velocity * dt;
 
-        var size = m_GameState.GameSize;
-        if (state.position.x - m_Radius < -size.x)
+        var s = m_GameState.GameSize;
+
+        if (Mathf.Abs(state.position.x) + m_Radius > s.x)
         {
-            state.position = new Vector2(-size.x + m_Radius, state.position.y);
-            state.velocity *= new Vector2(-1, 1);
-        }
-        else if (state.position.x + m_Radius > size.x)
-        {
-            state.position = new Vector2(size.x - m_Radius, state.position.y);
-            state.velocity *= new Vector2(-1, 1);
+            state.velocity.x *= -1;
+            state.position.x = Mathf.Sign(state.position.x) * (s.x - m_Radius);
         }
 
-        if (state.position.y + m_Radius > size.y)
+        if (Mathf.Abs(state.position.y) + m_Radius > s.y)
         {
-            state.position = new Vector2(state.position.x, size.y - m_Radius);
-            state.velocity *= new Vector2(1, -1);
-        }
-        else if (state.position.y - m_Radius < -size.y)
-        {
-            state.position = new Vector2(state.position.x, -size.y + m_Radius);
-            state.velocity *= new Vector2(1, -1);
+            state.velocity.y *= -1;
+            state.position.y = Mathf.Sign(state.position.y) * (s.y - m_Radius);
         }
 
         return state;
+    }
+
+    private void Update()
+    {
+        transform.position = Position;
     }
 }
